@@ -189,6 +189,39 @@ public class GTFSRTController {
      * @throws Exception if there's an error during file operations or JSON processing
      */
     @org.springframework.context.annotation.Profile("debug")
+    @GetMapping("/alerts-data")
+    public ResponseEntity<byte[]> getAlertsDataFile() throws Exception {
+        Path filePath = Paths.get("alerts_data.json");
+        if (!Files.exists(filePath)) {
+            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+        }
+        try {
+            String rawJson = Files.readString(filePath);
+            if (rawJson == null || rawJson.isEmpty()) {
+                return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+            }
+
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(rawJson);
+
+            DefaultPrettyPrinter pp = new DefaultPrettyPrinter();
+            DefaultIndenter indenter = new DefaultIndenter("    ", DefaultIndenter.SYS_LF);
+            pp.indentObjectsWith(indenter);
+            pp.indentArraysWith(indenter);
+
+            byte[] formatted = mapper.writer(pp).writeValueAsBytes(root);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.add(HttpHeaders.CONTENT_TYPE, "application/json; charset=UTF-8");
+            headers.add(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=alerts_data.json");
+
+            return new ResponseEntity<>(formatted, headers, HttpStatus.OK);
+        } catch (Exception e) {
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    @org.springframework.context.annotation.Profile("debug")
     @GetMapping("/siri-lite")
     public ResponseEntity<byte[]> getSiriLiteFile() throws Exception {
         Path filePath = Paths.get("sirilite_data.json");

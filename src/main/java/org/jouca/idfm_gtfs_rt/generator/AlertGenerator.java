@@ -274,9 +274,18 @@ public class AlertGenerator {
      * @throws Exception if there is an error fetching alert data, parsing JSON, or writing the output file
      * @see AlertFetcher#fetchAlertData()
      */
+    private void saveAlertsDataToFile(JsonNode data, String filePath) {
+        try (java.io.FileOutputStream out = new java.io.FileOutputStream(filePath)) {
+            out.write(data.toString().getBytes());
+        } catch (java.io.IOException e) {
+            System.err.println("Error writing alerts data to " + filePath + ": " + e.getMessage());
+        }
+    }
+
     public void generateAlert() throws Exception {
         System.out.println("Fetching alerts from online data...");
         JsonNode siriData = AlertFetcher.fetchAlertData();
+        saveAlertsDataToFile(siriData, "alerts_data.json");
 
         GtfsRealtime.FeedMessage.Builder feed = GtfsRealtime.FeedMessage.newBuilder();
 
