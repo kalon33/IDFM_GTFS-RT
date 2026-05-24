@@ -2809,6 +2809,25 @@ public class TripUpdateGenerator {
      * @param original the source feed (may contain REPLACEMENT entries)
      * @return a new FeedMessage with REPLACEMENT replaced by ADDED
      */
+    private Set<String> extractExistingEntityIds(GtfsRealtime.FeedMessage.Builder feedMessage) {
+        Set<String> ids = new java.util.HashSet<>();
+        for (int i = 0; i < feedMessage.getEntityCount(); i++) {
+            ids.add(feedMessage.getEntity(i).getId());
+        }
+        return ids;
+    }
+
+    private Map<String, Map<Integer, List<TripFinder.TripMeta>>> groupTheoreticalTripsByRouteAndDirection(
+            List<TripFinder.TripMeta> trips) {
+        Map<String, Map<Integer, List<TripFinder.TripMeta>>> result = new java.util.LinkedHashMap<>();
+        for (TripFinder.TripMeta trip : trips) {
+            result.computeIfAbsent(trip.routeId, k -> new java.util.LinkedHashMap<>())
+                  .computeIfAbsent(trip.directionId, k -> new ArrayList<>())
+                  .add(trip);
+        }
+        return result;
+    }
+
     private GtfsRealtime.FeedMessage convertReplacementToAdded(GtfsRealtime.FeedMessage original) {
         GtfsRealtime.FeedMessage.Builder builder = original.toBuilder();
         for (int i = 0; i < builder.getEntityCount(); i++) {
