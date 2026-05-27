@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import org.jouca.idfm_gtfs_rt.fetchers.AlertFetcher;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -33,6 +34,9 @@ import com.google.transit.realtime.GtfsRealtime;
  */
 @Component
 public class AlertGenerator {
+
+    @Autowired
+    private ElevatorAlertGenerator elevatorAlertGenerator;
     
     private static final String FIELD_CAUSE = "cause";
     private static final String FIELD_SEVERITY = "severity";
@@ -302,12 +306,15 @@ public class AlertGenerator {
             }
         }
 
+        // Append elevator outage alerts to the same feed
+        elevatorAlertGenerator.addElevatorAlertsToFeed(feed);
+
         // Build the feed message
         feed.setHeader(GtfsRealtime.FeedHeader.newBuilder()
             .setGtfsRealtimeVersion("2.0")
             .setIncrementality(GtfsRealtime.FeedHeader.Incrementality.FULL_DATASET)
             .setTimestamp(System.currentTimeMillis()));
-        
+
         try (FileOutputStream output = new FileOutputStream("gtfs-rt-alerts-idfm.pb")) {
             feed.build().writeTo(output);
         }

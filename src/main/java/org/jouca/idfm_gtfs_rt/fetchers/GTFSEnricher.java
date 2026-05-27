@@ -82,6 +82,20 @@ public class GTFSEnricher {
 
         rewriteZip(inputZipPath, outputZipPath, arretData, arridToZdcid);
         logger.info("Enriched GTFS written to {}", outputZipPath);
+
+        // Add elevator pathways (pathways.txt + virtual elevator stops in stops.txt)
+        logger.info("Adding elevator pathways to enriched GTFS…");
+        String tempPath = outputZipPath + ".elevtmp";
+        try {
+            ElevatorEnricher.addElevatorPathways(outputZipPath, tempPath);
+            java.nio.file.Files.move(java.nio.file.Paths.get(tempPath),
+                java.nio.file.Paths.get(outputZipPath),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            logger.info("Elevator pathways added successfully.");
+        } catch (Exception e) {
+            logger.warn("Elevator pathway enrichment failed (non-critical): {}", e.getMessage());
+            java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(tempPath));
+        }
     }
 
     // -------------------------------------------------------------------------

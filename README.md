@@ -47,6 +47,8 @@ If you want to **directly get feeds messages online**, you can use my **own HTTP
 - ⚡ **High Performance**: Optimized for handling large transit networks
 - 🚉 **Platform/Track Assignment**: Real-time platform codes via `stop_time_properties.assigned_stop_id` sourced from SIRI Lite `ExpectedQuayRef`, included directly in the main trip updates feed
 - 🗺️ **Enriched GTFS Static**: `stops.txt` enriched with `platform_code` and missing quay stops created from IDFM open-data
+- 🛗 **Elevator Pathways**: `pathways.txt` generated with elevator connections (pathway_mode=5) from IDFM `etat-des-ascenseurs` open-data
+- ♿ **Elevator Outage Alerts**: Out-of-service elevators published as `ACCESSIBILITY_ISSUE` alerts in the GTFS-RT alerts feed
 
 ## 🛠️ Technology Stack
 
@@ -188,7 +190,9 @@ See `.env.example` for a complete template with all available configuration opti
 ### GET `/gtfs-rt-alerts-idfm`
 Download GTFS-RT alerts feed (Protocol Buffer format)
 
-**Response**: Binary `.pb` file containing service alerts
+**Response**: Binary `.pb` file containing two types of alerts:
+- **Service disruptions**: delays, cancellations, and transit alerts from IDFM
+- **Elevator outages**: `ACCESSIBILITY_ISSUE` alerts (cause `TECHNICAL_PROBLEM`, severity `WARNING`) for each elevator with status `notavailable`, sourced from the IDFM `etat-des-ascenseurs` open-data. Each alert references the parent station via `informed_entity.stop_id = "IDFM:{zdcid}"`.
 
 **Example**:
 ```bash
@@ -229,9 +233,15 @@ curl -X POST "http://localhost:8507/getEntities?tripIds=trip1,trip2,trip3"
 ### GET `/gtfs`
 Download the enriched GTFS static ZIP file
 
-**Response**: A ZIP file equivalent to the standard IDFM GTFS feed with the following enrichments applied to `stops.txt`:
+**Response**: A ZIP file equivalent to the standard IDFM GTFS feed with the following enrichments:
+
+**`stops.txt`**
 - `platform_code` column populated for existing quay-level stops (e.g. `IDFM:471134`) using the `publiccode` field from the IDFM `arrets-transporteur` open-data dataset
 - New rows appended for quay stops present in the open-data but missing from the standard GTFS feed, with coordinates and `parent_station` resolved from the IDFM `relations` dataset
+- Virtual elevator stops (`location_type=2`, `stop_id=IDFM:elevator:{id}`) added for stations where no entrance node already exists
+
+**`pathways.txt`** *(generated)*
+- Elevator pathways (`pathway_mode=5`, `is_bidirectional=1`) connecting elevator stops to the nearest platform in the same station, with traversal time estimated from distance at 0.5 m/s (minimum 30 s), sourced from the IDFM `etat-des-ascenseurs` open-data dataset
 
 This file is intended to be used alongside `/gtfs-rt-trips-idfm` so consumers can resolve `assigned_stop_id` values to their platform codes.
 
@@ -264,14 +274,16 @@ idfm_gtfs-rt/
 │   │   └── GTFSRTController.java    # REST API endpoints
 │   ├── fetchers/
 │   │   ├── AlertFetcher.java        # Fetches alert data
-│   │   ├── GTFSEnricher.java        # Enriches GTFS stops with platform_code and missing quays
+│   │   ├── ElevatorEnricher.java    # Fetches elevator data; adds pathways.txt and elevator stops
+│   │   ├── GTFSEnricher.java        # Enriches GTFS stops with platform_code, missing quays, and elevators
 │   │   ├── GTFSFetcher.java         # Fetches and imports GTFS static data
 │   │   └── SiriLiteFetcher.java     # Fetches SIRI-Lite data
 │   ├── finders/
 │   │   └── TripFinder.java          # Matches real-time data to trips
 │   ├── generator/
-│   │   ├── AlertGenerator.java      # Generates GTFS-RT alerts
-│   │   └── TripUpdateGenerator.java # Generates GTFS-RT trip updates and platform feed
+│   │   ├── AlertGenerator.java      # Generates GTFS-RT alerts (transit + elevator outages)
+│   │   ├── ElevatorAlertGenerator.java # Appends ACCESSIBILITY_ISSUE alerts for out-of-service elevators
+│   │   └── TripUpdateGenerator.java # Generates GTFS-RT trip updates with platform assignments
 │   ├── records/
 │   │   └── EstimatedCall.java       # Data models
 │   └── services/
@@ -287,15 +299,27 @@ idfm_gtfs-rt/
 2. **GTFS Enrichment**: After downloading the GTFS ZIP, `GTFSEnricher` produces an enriched copy (`IDFM-gtfs-enriched.zip`) by:
    - Populating `platform_code` in `stops.txt` for all quay-level stops using IDFM `arrets-transporteur` open-data
    - Appending new rows for quay stops present in the open-data but absent from the GTFS, with coordinates and `parent_station` from IDFM `relations` open-data
+   - Adding virtual elevator stops (`location_type=2`) and generating `pathways.txt` with elevator connections (`pathway_mode=5`) via `ElevatorEnricher`, sourced from IDFM `etat-des-ascenseurs` open-data
 3. **Trip Matching**: Real-time SIRI-Lite data is matched with scheduled trips using `TripFinder`
 4. **Format Conversion**: Data is converted to GTFS-RT Protocol Buffers
 5. **Platform Assignment**: `stop_time_properties.assigned_stop_id` is added to each `StopTimeUpdate` where SIRI Lite provides an `ExpectedQuayRef`, directly in `gtfs-rt-trips-idfm.pb`
-6. **File Generation**: Updated feeds are written to `.pb` and `.json` files
-7. **API Serving**: REST endpoints serve the latest feed data to clients
+6. **Elevator Alerts**: Out-of-service elevators are appended as `ACCESSIBILITY_ISSUE` alerts to the GTFS-RT alerts feed by `ElevatorAlertGenerator`
+7. **File Generation**: Updated feeds are written to `.pb` and `.json` files
+8. **API Serving**: REST endpoints serve the latest feed data to clients
 
-### Platform Data Flow
+### Data Flow
 
-Consumers combine both outputs: the enriched GTFS provides `platform_code` per quay stop, while the trip updates feed provides the real-time quay assignment per `StopTimeUpdate` via `assigned_stop_id`.
+```
+IDFM arrets-transporteur ──┐
+IDFM relations.csv         ├──► GTFSEnricher ──► IDFM-gtfs-enriched.zip  (platform_code, missing quays)
+IDFM etat-des-ascenseurs ──┘         │                    + pathways.txt  (elevator connections)
+                                     │
+SIRI Lite (ExpectedQuayRef) ─────────┴──► gtfs-rt-trips-idfm.pb          (assigned_stop_id)
+
+IDFM etat-des-ascenseurs ──────────────► gtfs-rt-alerts-idfm.pb          (ACCESSIBILITY_ISSUE)
+```
+
+Consumers combine the enriched GTFS with the trip updates feed: the enriched GTFS provides `platform_code` per quay stop and elevator pathway data, while the trip updates feed provides real-time quay assignments via `assigned_stop_id`.
 
 ## 🐳 Docker Deployment
 
