@@ -209,29 +209,6 @@ public class GTFSRTController {
         return new ResponseEntity<>(fileContent, headers, HttpStatus.OK);
     }
 
-    /**
-     * Serves the GTFS-RT platform feed for IDFM.
-     *
-     * <p>This feed is equivalent to {@code /gtfs-rt-trips-idfm} but uses the specific
-     * quay stop_id (from SIRI Lite {@code ExpectedQuayRef}) in each StopTimeUpdate when
-     * available. Combined with the enriched GTFS from {@code /gtfs}, consumers can resolve
-     * the exact platform number for each stop.</p>
-     *
-     * @return Protocol Buffer bytes, or 404 if the file has not been generated yet
-     */
-    @GetMapping("/gtfs-rt-platforms-idfm")
-    public ResponseEntity<byte[]> getGtfsRtPlatformsFile() throws Exception {
-        Path filePath = Paths.get("gtfs-rt-platforms-idfm.pb");
-        if (!Files.exists(filePath)) {
-            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
-        }
-        byte[] fileContent = Files.readAllBytes(filePath);
-        HttpHeaders headers = new HttpHeaders();
-        headers.add(HttpHeaders.CONTENT_TYPE, "application/octet-stream");
-        headers.add(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=gtfs-rt-platforms-idfm.pb");
-        return new ResponseEntity<>(fileContent, headers, HttpStatus.OK);
-    }
-
     @org.springframework.context.annotation.Profile("debug")
     @GetMapping("/alerts-data")
     public ResponseEntity<byte[]> getAlertsDataFile() throws Exception {

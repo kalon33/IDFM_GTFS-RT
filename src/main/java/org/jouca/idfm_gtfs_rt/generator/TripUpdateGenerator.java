@@ -349,11 +349,8 @@ public class TripUpdateGenerator {
         // Beta feed: keeps REPLACEMENT as-is
         writeFeedToFile(builtFeed, "gtfs-rt-trips-idfm-beta.pb");
 
-        // Main feed: all REPLACEMENT converted to ADDED
+        // Main feed: all REPLACEMENT converted to ADDED, then enriched with platform assignments
         GtfsRealtime.FeedMessage mainFeed = convertReplacementToAdded(builtFeed);
-        writeFeedToFile(mainFeed, "gtfs-rt-trips-idfm.pb");
-
-        // Platform feed: same entities as main feed, stop_id overridden by ExpectedQuayRef where available
         generatePlatformFeed(mainFeed, siriLiteData);
     }
 
@@ -2893,8 +2890,8 @@ public class TripUpdateGenerator {
         }
 
         GtfsRealtime.FeedMessage built = platformFeed.build();
-        writeFeedToFile(built, "gtfs-rt-platforms-idfm.pb");
-        System.out.println("[Platforms] GTFS-RT platform feed written (" + built.getEntityCount() + " entities)");
+        writeFeedToFile(built, "gtfs-rt-trips-idfm.pb");
+        System.out.println("[Trips] GTFS-RT feed written (" + built.getEntityCount() + " entities, with platform assignments)");
     }
 
     /**
