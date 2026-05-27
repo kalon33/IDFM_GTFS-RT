@@ -34,6 +34,8 @@ If you want to **directly get feeds messages online**, you can use my **own HTTP
 
 > #### GTFS-RT Alerts : http://gtfsidfm.clarifygdps.com/gtfs-rt-alerts-idfm
 
+> #### Enriched GTFS Static : http://gtfsidfm.clarifygdps.com/gtfs
+
 ## ✨ Features
 
 - 🚆 **Real-time Transit Data**: Automatic fetching and processing of IDFM transit data
@@ -43,6 +45,8 @@ If you want to **directly get feeds messages online**, you can use my **own HTTP
 - 📊 **Trip Matching**: Intelligent matching of real-time data with scheduled GTFS trips
 - 🗄️ **SQLite Database**: Local GTFS data storage for fast access
 - ⚡ **High Performance**: Optimized for handling large transit networks
+- 🚉 **Platform/Track Assignment**: Real-time platform codes via `stop_time_properties.assigned_stop_id` sourced from SIRI Lite `ExpectedQuayRef`, included directly in the main trip updates feed
+- 🗺️ **Enriched GTFS Static**: `stops.txt` enriched with `platform_code` and missing quay stops created from IDFM open-data
 
 ## 🛠️ Technology Stack
 
@@ -196,7 +200,9 @@ curl -O http://localhost:8507/gtfs-rt-alerts-idfm
 ### GET `/gtfs-rt-trips-idfm`
 Download GTFS-RT trip updates feed (Protocol Buffer format)
 
-**Response**: Binary `.pb` file containing trip updates
+**Response**: Binary `.pb` file containing trip updates with `stop_time_properties.assigned_stop_id` set on each `StopTimeUpdate` where SIRI Lite provides an `ExpectedQuayRef`. This field indicates the real-time platform or track assignment without altering the scheduled `stop_id`.
+
+Use this feed together with the enriched GTFS from `/gtfs` to display platform/track numbers to passengers.
 
 **Example**:
 ```bash
@@ -218,6 +224,36 @@ curl -X POST "http://localhost:8507/getEntities?tripIds=trip1,trip2,trip3"
 
 **Response**: JSON object mapping trip IDs to their entity data
 
+---
+
+### GET `/gtfs`
+Download the enriched GTFS static ZIP file
+
+**Response**: A ZIP file equivalent to the standard IDFM GTFS feed with the following enrichments applied to `stops.txt`:
+- `platform_code` column populated for existing quay-level stops (e.g. `IDFM:471134`) using the `publiccode` field from the IDFM `arrets-transporteur` open-data dataset
+- New rows appended for quay stops present in the open-data but missing from the standard GTFS feed, with coordinates and `parent_station` resolved from the IDFM `relations` dataset
+
+This file is intended to be used alongside `/gtfs-rt-trips-idfm` so consumers can resolve `assigned_stop_id` values to their platform codes.
+
+**Example**:
+```bash
+curl -O http://localhost:8507/gtfs
+```
+
+---
+
+### GET `/siri-lite` *(debug profile only)*
+Download the raw SIRI-Lite data as pretty-printed JSON
+
+**Response**: JSON file containing the last SIRI-Lite response fetched from IDFM, formatted with 4-space indentation. Only available when the application is started with the `debug` Spring profile.
+
+---
+
+### GET `/alerts-data` *(debug profile only)*
+Download the raw alerts data as pretty-printed JSON
+
+**Response**: JSON file containing the last alerts response fetched from IDFM, formatted with 4-space indentation. Only available when the application is started with the `debug` Spring profile.
+
 ## 🏗️ Project Structure
 
 ```
@@ -228,13 +264,14 @@ idfm_gtfs-rt/
 │   │   └── GTFSRTController.java    # REST API endpoints
 │   ├── fetchers/
 │   │   ├── AlertFetcher.java        # Fetches alert data
-│   │   ├── GTFSFetcher.java         # Fetches GTFS static data
+│   │   ├── GTFSEnricher.java        # Enriches GTFS stops with platform_code and missing quays
+│   │   ├── GTFSFetcher.java         # Fetches and imports GTFS static data
 │   │   └── SiriLiteFetcher.java     # Fetches SIRI-Lite data
 │   ├── finders/
 │   │   └── TripFinder.java          # Matches real-time data to trips
 │   ├── generator/
 │   │   ├── AlertGenerator.java      # Generates GTFS-RT alerts
-│   │   └── TripUpdateGenerator.java # Generates GTFS-RT trip updates
+│   │   └── TripUpdateGenerator.java # Generates GTFS-RT trip updates and platform feed
 │   ├── records/
 │   │   └── EstimatedCall.java       # Data models
 │   └── services/
@@ -247,10 +284,18 @@ idfm_gtfs-rt/
 ## 🔄 How It Works
 
 1. **Data Fetching**: The application periodically fetches GTFS static data and real-time updates from IDFM
-2. **Trip Matching**: Real-time data is matched with scheduled trips using the `TripFinder`
-3. **Format Conversion**: Data is converted to GTFS-RT Protocol Buffers
-4. **File Generation**: Updated feeds are written to `.pb` and `.json` files
-5. **API Serving**: REST endpoints serve the latest feed data to clients
+2. **GTFS Enrichment**: After downloading the GTFS ZIP, `GTFSEnricher` produces an enriched copy (`IDFM-gtfs-enriched.zip`) by:
+   - Populating `platform_code` in `stops.txt` for all quay-level stops using IDFM `arrets-transporteur` open-data
+   - Appending new rows for quay stops present in the open-data but absent from the GTFS, with coordinates and `parent_station` from IDFM `relations` open-data
+3. **Trip Matching**: Real-time SIRI-Lite data is matched with scheduled trips using `TripFinder`
+4. **Format Conversion**: Data is converted to GTFS-RT Protocol Buffers
+5. **Platform Assignment**: `stop_time_properties.assigned_stop_id` is added to each `StopTimeUpdate` where SIRI Lite provides an `ExpectedQuayRef`, directly in `gtfs-rt-trips-idfm.pb`
+6. **File Generation**: Updated feeds are written to `.pb` and `.json` files
+7. **API Serving**: REST endpoints serve the latest feed data to clients
+
+### Platform Data Flow
+
+Consumers combine both outputs: the enriched GTFS provides `platform_code` per quay stop, while the trip updates feed provides the real-time quay assignment per `StopTimeUpdate` via `assigned_stop_id`.
 
 ## 🐳 Docker Deployment
 

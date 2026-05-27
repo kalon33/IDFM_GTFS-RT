@@ -188,6 +188,27 @@ public class GTFSRTController {
      *         or formatting the data
      * @throws Exception if there's an error during file operations or JSON processing
      */
+    /**
+     * Serves the enriched GTFS static ZIP file with platform_code populated in stops.txt.
+     *
+     * <p>The file is generated during the GTFS refresh cycle by {@code GTFSEnricher}.
+     * platform_code values are sourced from the IDFM arrets-transporteur open-data JSON.</p>
+     *
+     * @return the GTFS ZIP bytes, or 404 if the enriched file has not been generated yet
+     */
+    @GetMapping("/gtfs")
+    public ResponseEntity<byte[]> getEnrichedGtfs() throws Exception {
+        Path filePath = Paths.get("IDFM-gtfs-enriched.zip");
+        if (!Files.exists(filePath)) {
+            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+        }
+        byte[] fileContent = Files.readAllBytes(filePath);
+        HttpHeaders headers = new HttpHeaders();
+        headers.add(HttpHeaders.CONTENT_TYPE, "application/zip");
+        headers.add(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=IDFM-gtfs-enriched.zip");
+        return new ResponseEntity<>(fileContent, headers, HttpStatus.OK);
+    }
+
     @org.springframework.context.annotation.Profile("debug")
     @GetMapping("/alerts-data")
     public ResponseEntity<byte[]> getAlertsDataFile() throws Exception {

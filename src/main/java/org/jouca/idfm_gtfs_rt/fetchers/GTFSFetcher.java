@@ -101,6 +101,21 @@ public class GTFSFetcher {
         }
 
         // ===================================
+        // Step 1.5: Enrich GTFS with platform codes
+        // ===================================
+        // Creates IDFM-gtfs-enriched.zip: a copy of the GTFS with platform_code filled
+        // in stops.txt using the IDFM arrets-transporteur open-data JSON.
+        // This file is served via the /gtfs endpoint; the database import below uses
+        // the original ZIP and is not affected by this step.
+        logger.info("Step 1.5/5: Generating enriched GTFS with platform codes...");
+        try {
+            GTFSEnricher.enrichGTFS("IDFM-gtfs.zip", "IDFM-gtfs-enriched.zip");
+            logger.info("Enriched GTFS created successfully.");
+        } catch (Exception e) {
+            logger.warn("GTFS enrichment failed (non-critical, /gtfs endpoint may serve stale data): {}", e.getMessage());
+        }
+
+        // ===================================
         // Step 2: Extract the ZIP archive
         // ===================================
         // Extracts all files from IDFM-gtfs.zip to the extracted-gtfs/ directory.

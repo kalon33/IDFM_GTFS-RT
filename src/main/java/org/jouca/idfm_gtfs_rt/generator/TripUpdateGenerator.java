@@ -8,6 +8,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -103,6 +104,15 @@ public class TripUpdateGenerator {
 
     /** SIRI Lite JSON field name for operator reference */
     private static final String FIELD_OPERATOR_REF = "OperatorRef";
+
+    /** SIRI Lite JSON field name for departure stop assignment (contains ExpectedQuayRef) */
+    private static final String FIELD_DEPARTURE_STOP_ASSIGNMENT = "DepartureStopAssignment";
+
+    /** SIRI Lite JSON field name for arrival stop assignment (contains ExpectedQuayRef) */
+    private static final String FIELD_ARRIVAL_STOP_ASSIGNMENT = "ArrivalStopAssignment";
+
+    /** SIRI Lite JSON field name for the expected quay (platform) reference */
+    private static final String FIELD_EXPECTED_QUAY_REF = "ExpectedQuayRef";
 
     /** Blacklist of operator IDs to exclude from GTFS-RT feed and trip matching */
     private static final Set<String> OPERATOR_BLACKLIST = Set.of(
@@ -339,8 +349,9 @@ public class TripUpdateGenerator {
         // Beta feed: keeps REPLACEMENT as-is
         writeFeedToFile(builtFeed, "gtfs-rt-trips-idfm-beta.pb");
 
-        // Main feed: all REPLACEMENT converted to ADDED
-        writeFeedToFile(convertReplacementToAdded(builtFeed), "gtfs-rt-trips-idfm.pb");
+        // Main feed: all REPLACEMENT converted to ADDED, then enriched with platform assignments
+        GtfsRealtime.FeedMessage mainFeed = convertReplacementToAdded(builtFeed);
+        generatePlatformFeed(mainFeed, siriLiteData);
     }
 
     /**
@@ -2809,6 +2820,7 @@ public class TripUpdateGenerator {
      * @param original the source feed (may contain REPLACEMENT entries)
      * @return a new FeedMessage with REPLACEMENT replaced by ADDED
      */
+    @SuppressWarnings("unused")
     private Set<String> extractExistingEntityIds(GtfsRealtime.FeedMessage.Builder feedMessage) {
         Set<String> ids = new java.util.HashSet<>();
         for (int i = 0; i < feedMessage.getEntityCount(); i++) {
@@ -2817,6 +2829,7 @@ public class TripUpdateGenerator {
         return ids;
     }
 
+    @SuppressWarnings("unused")
     private Map<String, Map<Integer, List<TripFinder.TripMeta>>> groupTheoreticalTripsByRouteAndDirection(
             List<TripFinder.TripMeta> trips) {
         Map<String, Map<Integer, List<TripFinder.TripMeta>>> result = new java.util.LinkedHashMap<>();
@@ -2826,6 +2839,150 @@ public class TripUpdateGenerator {
                   .add(trip);
         }
         return result;
+    }
+
+    // =========================================================================
+    // Platform GTFS-RT feed
+    // =========================================================================
+
+    /**
+     * Generates a GTFS-RT platform feed that mirrors {@code mainFeed} exactly
+     * (same number of entities, same trips, same schedule relationships) but
+     * overrides each StopTimeUpdate's {@code stop_id} with the specific quay
+     * stop ID whenever the SIRI Lite {@code ExpectedQuayRef} field is present.
+     *
+     * <p>Trips for which no current SIRI data is available (re-emitted cached
+     * trips, etc.) are copied from the main feed without modification.
+     *
+     * @param mainFeed     the already-built main GTFS-RT feed
+     * @param siriLiteData the same SIRI Lite payload used to build the main feed
+     */
+    private void generatePlatformFeed(GtfsRealtime.FeedMessage mainFeed, JsonNode siriLiteData) {
+        // Build vehicleId → SIRI entity map for fast lookup
+        Map<String, JsonNode> vehicleToEntity = new HashMap<>();
+        for (JsonNode entity : extractEntitiesFromSiriLite(siriLiteData)) {
+            String vehicleId = entity.path("DatedVehicleJourneyRef").path(FIELD_VALUE).asText(null);
+            if (vehicleId != null) vehicleToEntity.put(vehicleId, entity);
+        }
+
+        // Invert vehicleToTrip → tripId → vehicleId (keep first if collision)
+        Map<String, String> tripToVehicle = new HashMap<>();
+        vehicleToTrip.forEach((vehicleId, tripId) -> tripToVehicle.putIfAbsent(tripId, vehicleId));
+
+        GtfsRealtime.FeedMessage.Builder platformFeed = mainFeed.toBuilder().clearEntity();
+
+        for (GtfsRealtime.FeedEntity feedEntity : mainFeed.getEntityList()) {
+            if (!feedEntity.hasTripUpdate()) {
+                platformFeed.addEntity(feedEntity);
+                continue;
+            }
+
+            String tripId = feedEntity.getTripUpdate().getTrip().getTripId();
+            String vehicleId = tripToVehicle.get(tripId);
+            JsonNode siriEntity = (vehicleId != null) ? vehicleToEntity.get(vehicleId) : null;
+
+            if (siriEntity == null) {
+                // Re-emitted or synthetic trip: no current SIRI data → copy as-is
+                platformFeed.addEntity(feedEntity);
+            } else {
+                platformFeed.addEntity(rebuildWithPlatformStops(feedEntity, siriEntity, tripId));
+            }
+        }
+
+        GtfsRealtime.FeedMessage built = platformFeed.build();
+        writeFeedToFile(built, "gtfs-rt-trips-idfm.pb");
+        System.out.println("[Trips] GTFS-RT feed written (" + built.getEntityCount() + " entities, with platform assignments)");
+    }
+
+    /**
+     * Returns a copy of {@code original} where each StopTimeUpdate gains a
+     * {@code stop_time_properties.assigned_stop_id} set to the quay stop ID
+     * from {@code ExpectedQuayRef} when one is resolvable.
+     *
+     * <p>{@code stop_id} is intentionally left unchanged so that trip-matching
+     * against the static GTFS stop_times continues to work correctly.
+     * {@code assigned_stop_id} is the GTFS-RT field specifically designed for
+     * real-time platform/track assignments.
+     *
+     * <p>All other fields (times, schedule relationship, vehicle, etc.) are
+     * preserved unchanged.
+     */
+    private GtfsRealtime.FeedEntity rebuildWithPlatformStops(
+            GtfsRealtime.FeedEntity original, JsonNode siriEntity, String tripId) {
+
+        // Build stop_sequence → quay stop_id map from SIRI estimated calls
+        Map<Integer, String> seqToQuayId = buildQuayStopIdMap(siriEntity, tripId);
+        if (seqToQuayId.isEmpty()) return original;
+
+        GtfsRealtime.TripUpdate tu = original.getTripUpdate();
+        GtfsRealtime.TripUpdate.Builder tuBuilder = tu.toBuilder().clearStopTimeUpdate();
+        for (GtfsRealtime.TripUpdate.StopTimeUpdate stu : tu.getStopTimeUpdateList()) {
+            String quayId = seqToQuayId.get(stu.getStopSequence());
+            if (quayId != null) {
+                tuBuilder.addStopTimeUpdate(stu.toBuilder()
+                        .setStopTimeProperties(
+                                GtfsRealtime.TripUpdate.StopTimeUpdate.StopTimeProperties.newBuilder()
+                                        .setAssignedStopId(quayId))
+                        .build());
+            } else {
+                tuBuilder.addStopTimeUpdate(stu);
+            }
+        }
+        return original.toBuilder().setTripUpdate(tuBuilder).build();
+    }
+
+    /**
+     * Builds a map of {@code stop_sequence → quay stop_id} by scanning a SIRI
+     * entity's EstimatedCalls for {@code ExpectedQuayRef} fields.
+     *
+     * <p>The stop sequence is resolved the same way as the main feed (via
+     * {@link TripFinder#findStopSequence}), so cache hits are virtually free.
+     */
+    private Map<Integer, String> buildQuayStopIdMap(JsonNode siriEntity, String tripId) {
+        Map<Integer, String> result = new HashMap<>();
+
+        List<JsonNode> calls = getSortedEstimatedCalls(siriEntity);
+        List<String> processedSeqs = new ArrayList<>();
+
+        for (JsonNode call : calls) {
+            String quayStopId = resolveQuayStopId(call);
+            if (quayStopId == null) continue;
+
+            if (!call.has(FIELD_STOP_POINT_REF)) continue;
+            String[] parts = call.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":");
+            if (parts.length < 4) continue;
+
+            String regularStopId = TripFinder.resolveStopId(parts[3]);
+            if (regularStopId == null) continue;
+
+            String seq = TripFinder.findStopSequence(tripId, regularStopId, processedSeqs);
+            if (seq == null) continue;
+            processedSeqs.add(seq);
+
+            result.put(Integer.parseInt(seq), quayStopId);
+        }
+        return result;
+    }
+
+    /**
+     * Extracts the quay stop ID from {@code DepartureStopAssignment} or
+     * {@code ArrivalStopAssignment} in a SIRI EstimatedCall.
+     *
+     * <p>Format: {@code STIF:StopPoint:Q:471581:} → {@code IDFM:471581}.
+     * The stop_id is constructed directly from the numeric quay ID without
+     * a DB lookup, because quay stops may be absent from the unenriched
+     * gtfs.db but present in the enriched GTFS served via /gtfs.
+     */
+    private String resolveQuayStopId(JsonNode estimatedCall) {
+        for (String field : new String[]{FIELD_DEPARTURE_STOP_ASSIGNMENT, FIELD_ARRIVAL_STOP_ASSIGNMENT}) {
+            JsonNode quayRef = estimatedCall.path(field).path(FIELD_EXPECTED_QUAY_REF).path(FIELD_VALUE);
+            if (quayRef.isMissingNode()) continue;
+            String[] parts = quayRef.asText().split(":");
+            if (parts.length >= 4 && parts[3].matches("\\d+")) {
+                return "IDFM:" + parts[3];
+            }
+        }
+        return null;
     }
 
     private GtfsRealtime.FeedMessage convertReplacementToAdded(GtfsRealtime.FeedMessage original) {
