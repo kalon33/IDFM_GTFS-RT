@@ -1,6 +1,10 @@
 package org.jouca.idfm_gtfs_rt.fetchers;
 
-import java.io.IOException;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.zip.*;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -101,6 +105,17 @@ public class GTFSFetcher {
         }
 
         // ===================================
+        // Step 1.2: Repair malformed pathways.txt header in downloaded ZIP
+        // ===================================
+        // The IDFM source GTFS has pathways.txt with only 7 header columns but 12
+        // data columns, which makes gtfs-import reject the file. Fix it in-place.
+        try {
+            repairPathwaysTxt("IDFM-gtfs.zip");
+        } catch (Exception e) {
+            logger.warn("Failed to repair pathways.txt header (non-critical): {}", e.getMessage());
+        }
+
+        // ===================================
         // Step 1.5: Enrich GTFS with platform codes
         // ===================================
         // Creates IDFM-gtfs-enriched.zip: a copy of the GTFS with platform_code filled
@@ -197,9 +212,102 @@ public class GTFSFetcher {
         }
     }
 
+    private static final List<String> PATHWAYS_COLUMNS = List.of(
+        "pathway_id", "from_stop_id", "to_stop_id", "pathway_mode", "is_bidirectional",
+        "length", "traversal_time", "stair_count", "max_slope", "min_width",
+        "signposted_as", "reversed_signposted_as"
+    );
+
+    /**
+     * Repairs a malformed pathways.txt in-place inside a GTFS ZIP where the header
+     * has fewer columns than the data rows (known issue with the IDFM source feed).
+     */
+    private static void repairPathwaysTxt(String zipPath) throws IOException {
+        Path path = Paths.get(zipPath);
+        byte[] pathwaysBytes = null;
+
+        try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(path))) {
+            ZipEntry entry;
+            while ((entry = zin.getNextEntry()) != null) {
+                if ("pathways.txt".equals(entry.getName())) {
+                    pathwaysBytes = zin.readAllBytes();
+                }
+                zin.closeEntry();
+            }
+        }
+
+        if (pathwaysBytes == null) return;
+
+        List<String> lines = new ArrayList<>(Arrays.asList(
+            new String(pathwaysBytes, StandardCharsets.UTF_8).split("\r?\n", -1)));
+        // Drop trailing empty lines produced by a terminal newline in the split
+        while (!lines.isEmpty() && lines.get(lines.size() - 1).trim().isEmpty()) {
+            lines.remove(lines.size() - 1);
+        }
+        if (lines.size() < 2) return;
+
+        // Find the max column count across all data rows (not just the first)
+        int maxCols = 0;
+        for (int i = 1; i < lines.size(); i++) {
+            int cols = GTFSEnricher.parseCsvLine(lines.get(i)).length;
+            if (cols > maxCols) maxCols = cols;
+        }
+        if (maxCols == 0) return;
+
+        String[] headerFields = GTFSEnricher.parseCsvLine(lines.get(0));
+        boolean needsRepair = headerFields.length != maxCols;
+
+        // Pad any data row that has fewer columns than maxCols (e.g. last row missing trailing commas)
+        int paddedRows = 0;
+        for (int i = 1; i < lines.size(); i++) {
+            int cols = GTFSEnricher.parseCsvLine(lines.get(i)).length;
+            if (cols < maxCols) {
+                StringBuilder sb = new StringBuilder(lines.get(i));
+                for (int j = cols; j < maxCols; j++) sb.append(',');
+                lines.set(i, sb.toString());
+                paddedRows++;
+                needsRepair = true;
+            }
+        }
+
+        if (!needsRepair) return;
+
+        String repairedHeader = String.join(",", PATHWAYS_COLUMNS.subList(0, Math.min(maxCols, PATHWAYS_COLUMNS.size())));
+        if (maxCols > PATHWAYS_COLUMNS.size()) {
+            for (int i = PATHWAYS_COLUMNS.size(); i < maxCols; i++) repairedHeader += ",extra_" + i;
+        }
+        lines.set(0, repairedHeader);
+        logger.info("Repaired pathways.txt: header {} → {} columns, padded {} short rows",
+            headerFields.length, maxCols, paddedRows);
+
+        byte[] repairedBytes = (String.join("\n", lines) + "\n").getBytes(StandardCharsets.UTF_8);
+
+        Path tmp = Files.createTempFile("gtfs-repair-", ".zip");
+        try {
+            try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(path));
+                 ZipOutputStream zout = new ZipOutputStream(Files.newOutputStream(tmp))) {
+                ZipEntry entry;
+                while ((entry = zin.getNextEntry()) != null) {
+                    zout.putNextEntry(new ZipEntry(entry.getName()));
+                    if ("pathways.txt".equals(entry.getName())) {
+                        zout.write(repairedBytes);
+                    } else {
+                        zin.transferTo(zout);
+                    }
+                    zout.closeEntry();
+                    zin.closeEntry();
+                }
+            }
+            Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            Files.deleteIfExists(tmp);
+            throw e;
+        }
+    }
+
     /**
      * Creates a database index using sqlite3.
-     * 
+     *
      * @param outputFilePath The path to the SQLite database
      * @param indexName The name of the index to create
      * @param sql The CREATE INDEX SQL statement

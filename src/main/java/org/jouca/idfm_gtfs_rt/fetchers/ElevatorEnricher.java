@@ -303,13 +303,16 @@ public class ElevatorEnricher {
 
         // Collect existing pathways.txt rows (to merge, not overwrite)
         List<String[]> existingPathwayRows = new ArrayList<>();
+        String existingPathwaysHeader = null;
 
         // First pass: find any existing pathways.txt
         try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(inputPath))) {
             ZipEntry entry;
             while ((entry = zin.getNextEntry()) != null) {
                 if ("pathways.txt".equals(entry.getName())) {
-                    existingPathwayRows = parseExistingPathways(zin.readAllBytes());
+                    byte[] bytes = zin.readAllBytes();
+                    existingPathwaysHeader = parsePathwaysHeader(bytes);
+                    existingPathwayRows = parseExistingPathways(bytes);
                 }
                 zin.closeEntry();
             }
@@ -354,15 +357,17 @@ public class ElevatorEnricher {
 
             // Write (merged) pathways.txt
             zout.putNextEntry(new ZipEntry("pathways.txt"));
-            zout.write(buildPathwaysTxt(mergedPathways));
+            zout.write(buildPathwaysTxt(mergedPathways, existingPathwaysHeader));
             zout.closeEntry();
         }
     }
 
-    /**
-     * Parses an existing {@code pathways.txt} byte array into a list of field
-     * arrays (header row is skipped; each element is one pathway row).
-     */
+    private static String parsePathwaysHeader(byte[] bytes) throws IOException {
+        BufferedReader reader = new BufferedReader(
+            new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8));
+        return reader.readLine();
+    }
+
     private static List<String[]> parseExistingPathways(byte[] bytes) throws IOException {
         List<String[]> rows = new ArrayList<>();
         BufferedReader reader = new BufferedReader(
@@ -412,10 +417,20 @@ public class ElevatorEnricher {
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
 
-    private static byte[] buildPathwaysTxt(List<String[]> rows) {
+    private static byte[] buildPathwaysTxt(List<String[]> rows, String originalHeader) {
+        String header = (originalHeader != null && !originalHeader.isBlank())
+            ? originalHeader
+            : "pathway_id,from_stop_id,to_stop_id,pathway_mode,is_bidirectional,length,traversal_time";
+        int colCount = GTFSEnricher.parseCsvLine(header).length;
         StringBuilder sb = new StringBuilder();
-        sb.append("pathway_id,from_stop_id,to_stop_id,pathway_mode,is_bidirectional,length,traversal_time\n");
+        sb.append(header).append("\n");
         for (String[] row : rows) {
+            if (row.length < colCount) {
+                String[] padded = new String[colCount];
+                Arrays.fill(padded, "");
+                System.arraycopy(row, 0, padded, 0, row.length);
+                row = padded;
+            }
             sb.append(GTFSEnricher.joinCsvLine(row)).append("\n");
         }
         return sb.toString().getBytes(StandardCharsets.UTF_8);
