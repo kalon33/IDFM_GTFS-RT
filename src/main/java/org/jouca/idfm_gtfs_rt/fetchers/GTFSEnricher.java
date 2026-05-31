@@ -96,6 +96,20 @@ public class GTFSEnricher {
             logger.warn("Elevator pathway enrichment failed (non-critical): {}", e.getMessage());
             java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(tempPath));
         }
+
+        // Add fares (fare_attributes.txt, fare_rules.txt, zone_id in stops.txt)
+        logger.info("Adding fares to enriched GTFS…");
+        String fareTempPath = outputZipPath + ".faretmp";
+        try {
+            FareEnricher.addFares(outputZipPath, fareTempPath);
+            java.nio.file.Files.move(java.nio.file.Paths.get(fareTempPath),
+                java.nio.file.Paths.get(outputZipPath),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            logger.info("Fares added successfully.");
+        } catch (Exception e) {
+            logger.warn("Fare enrichment failed (non-critical): {}", e.getMessage());
+            java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(fareTempPath));
+        }
     }
 
     // -------------------------------------------------------------------------
