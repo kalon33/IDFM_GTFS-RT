@@ -119,25 +119,27 @@ public class GTFSFetcher {
         // Step 1.5: Enrich GTFS with platform codes
         // ===================================
         // Creates IDFM-gtfs-enriched.zip: a copy of the GTFS with platform_code filled
-        // in stops.txt using the IDFM arrets-transporteur open-data JSON.
-        // This file is served via the /gtfs endpoint; the database import below uses
-        // the original ZIP and is not affected by this step.
+        // in stops.txt from the NeTEx API. Both the /gtfs endpoint and the SQLite import
+        // below use this enriched ZIP so that platform codes are available everywhere.
         logger.info("Step 1.5/5: Generating enriched GTFS with platform codes...");
+        boolean enrichmentSucceeded = false;
         try {
             GTFSEnricher.enrichGTFS("IDFM-gtfs.zip", "IDFM-gtfs-enriched.zip");
             logger.info("Enriched GTFS created successfully.");
+            enrichmentSucceeded = true;
         } catch (Exception e) {
-            logger.warn("GTFS enrichment failed (non-critical, /gtfs endpoint may serve stale data): {}", e.getMessage());
+            logger.warn("GTFS enrichment failed (non-critical, falling back to original ZIP): {}", e.getMessage());
         }
+        String gtfsZipToImport = enrichmentSucceeded ? "./IDFM-gtfs-enriched.zip" : "./IDFM-gtfs.zip";
 
         // ===================================
         // Step 2: Extract the ZIP archive
         // ===================================
-        // Extracts all files from IDFM-gtfs.zip to the extracted-gtfs/ directory.
+        // Extracts all files from the enriched (or original) ZIP to the extracted-gtfs/ directory.
         // Maintains directory structure and overwrites existing files.
         logger.info("Step 2/5: Extracting ZIP archive...");
         try {
-            extractZipFile("IDFM-gtfs.zip", java.nio.file.Paths.get("extracted-gtfs"));
+            extractZipFile(gtfsZipToImport, java.nio.file.Paths.get("extracted-gtfs"));
             logger.info("ZIP archive extracted successfully.");
         } catch (IOException e) {
             logger.error("Failed to unzip GTFS data: {}", e.getMessage());
@@ -149,7 +151,7 @@ public class GTFSFetcher {
         // Executes the gtfs-import CLI tool to parse GTFS files and populate the database.
         // The gtfs-import tool creates standard GTFS tables (routes, trips, stops, stop_times, etc.).
         logger.info("Step 3/5: Importing GTFS data into SQLite database...");
-        importGtfsData("./IDFM-gtfs.zip", outputFilePath);
+        importGtfsData(gtfsZipToImport, outputFilePath);
         logger.info("GTFS data imported successfully.");
 
         // =============================================================================

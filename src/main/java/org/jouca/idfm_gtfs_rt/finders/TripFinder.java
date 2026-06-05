@@ -1285,8 +1285,55 @@ public class TripFinder {
     }
 
     /**
+     * Finds a quay stop by searching siblings of the resolved stop that share the same
+     * parent station and have the given platform code.
+     *
+     * <p>Lookup strategy:
+     * <ol>
+     *   <li>Find the stop whose {@code stop_id} ends with {@code :stopCode}.</li>
+     *   <li>Use its {@code parent_station} (or the stop itself if it has none) as
+     *       the anchor station.</li>
+     *   <li>Return the first child stop under that anchor with a matching
+     *       {@code platform_code}.</li>
+     * </ol>
+     *
+     * @param stopCode     numeric part of the SIRI StopPointRef (e.g. {@code "58718"})
+     * @param platformCode value from DeparturePlatformName / ArrivalPlatformName (e.g. {@code "32"})
+     * @return GTFS {@code stop_id} of the quay, or {@code null} if not found
+     */
+    public static String findStopByParentAndPlatformCode(String stopCode, String platformCode) {
+        if (stopCode == null || platformCode == null || platformCode.isBlank()) return null;
+
+        String query = """
+            SELECT child.stop_id FROM stops child
+            WHERE child.parent_station = (
+                SELECT CASE
+                    WHEN s.parent_station IS NOT NULL AND s.parent_station != ''
+                    THEN s.parent_station
+                    ELSE s.stop_id
+                END
+                FROM stops s WHERE s.stop_id LIKE ? LIMIT 1
+            )
+            AND (child.platform_code = ? OR child.platform_code LIKE ? || '%')
+            LIMIT 1
+            """;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
+            stmt.setString(1, "%:" + stopCode);
+            stmt.setString(2, platformCode);
+            stmt.setString(3, platformCode);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) return rs.getString(COL_STOP_ID);
+            }
+        } catch (Exception e) {
+            logger.debug("Error finding stop by parent+platform: stopCode={}, platform={}", stopCode, platformCode, e);
+        }
+        return null;
+    }
+
+    /**
      * Finds a stop ID from the object_codes_extension table using a stop extension code.
-     * 
+     *
      * <p>This method searches the object_codes_extension table for stop_point entries
      * matching the given stop extension code in the 'netex_zder_quay' object system.
      * This is specific to certain GTFS feeds that use NeTEx extensions.

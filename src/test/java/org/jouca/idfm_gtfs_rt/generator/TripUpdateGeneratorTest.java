@@ -1438,20 +1438,201 @@ class TripUpdateGeneratorTest {
         java.lang.reflect.Field field = TripUpdateGenerator.class.getDeclaredField("currentEpochSecond");
         field.setAccessible(true);
         field.setLong(generator, System.currentTimeMillis() / 1000);
-        
+
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
             "isEstimatedCallInPast", JsonNode.class);
         method.setAccessible(true);
-        
+
         String json = """
             {
                 "AimedDepartureTime": "2020-01-01T10:00:00Z"
             }
             """;
-        
+
         JsonNode call = objectMapper.readTree(json);
         boolean result = (boolean) method.invoke(generator, call);
-        
+
         assertTrue(result);
+    }
+
+    // =========================================================================
+    // Tests pour la résolution du quai (ExpectedQuayRef)
+    // =========================================================================
+
+    @Test
+    void testResolveQuayStopIdWithDepartureStopAssignment() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "resolveQuayStopId", JsonNode.class);
+        method.setAccessible(true);
+
+        // JSON exact reproduisant le cas utilisateur : quai STIF:StopPoint:Q:472796:
+        String json = """
+            {
+                "StopPointRef": {
+                    "value": "STIF:StopArea:SP:58718:"
+                },
+                "DepartureStopAssignment": {
+                    "ExpectedQuayRef": {
+                        "value": "STIF:StopPoint:Q:472796:"
+                    }
+                },
+                "ArrivalStopAssignment": {
+                    "ExpectedQuayRef": {
+                        "value": "STIF:StopPoint:Q:472796:"
+                    }
+                }
+            }
+            """;
+
+        JsonNode call = objectMapper.readTree(json);
+        String result = (String) method.invoke(generator, call);
+
+        assertEquals("IDFM:472796", result,
+            "Le quai devrait être résolu en IDFM:472796 depuis DepartureStopAssignment");
+    }
+
+    @Test
+    void testResolveQuayStopIdWithOnlyArrivalStopAssignment() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "resolveQuayStopId", JsonNode.class);
+        method.setAccessible(true);
+
+        String json = """
+            {
+                "ArrivalStopAssignment": {
+                    "ExpectedQuayRef": {
+                        "value": "STIF:StopPoint:Q:471581:"
+                    }
+                }
+            }
+            """;
+
+        JsonNode call = objectMapper.readTree(json);
+        String result = (String) method.invoke(generator, call);
+
+        assertEquals("IDFM:471581", result,
+            "Le quai devrait être résolu en IDFM:471581 depuis ArrivalStopAssignment");
+    }
+
+    @Test
+    void testResolveQuayStopIdWithNoAssignment() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "resolveQuayStopId", JsonNode.class);
+        method.setAccessible(true);
+
+        // Pas de DepartureStopAssignment ni ArrivalStopAssignment → null
+        String json = """
+            {
+                "StopPointRef": {
+                    "value": "STIF:StopArea:SP:58718:"
+                }
+            }
+            """;
+
+        JsonNode call = objectMapper.readTree(json);
+        String result = (String) method.invoke(generator, call);
+
+        assertNull(result, "Aucun quai ne devrait être résolu si aucun StopAssignment n'est présent");
+    }
+
+    @Test
+    void testResolveQuayStopIdWithNonNumericQuayId() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "resolveQuayStopId", JsonNode.class);
+        method.setAccessible(true);
+
+        String json = """
+            {
+                "DepartureStopAssignment": {
+                    "ExpectedQuayRef": {
+                        "value": "STIF:StopPoint:Q:ABCDEF:"
+                    }
+                }
+            }
+            """;
+
+        JsonNode call = objectMapper.readTree(json);
+        String result = (String) method.invoke(generator, call);
+
+        assertNull(result, "Un quai non numérique ne devrait pas être résolu");
+    }
+
+    @Test
+    void testResolveQuayStopIdWithMissingExpectedQuayRef() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "resolveQuayStopId", JsonNode.class);
+        method.setAccessible(true);
+
+        // DepartureStopAssignment présent mais sans ExpectedQuayRef
+        String json = """
+            {
+                "DepartureStopAssignment": {
+                    "AimedQuayRef": {
+                        "value": "STIF:StopPoint:Q:472796:"
+                    }
+                }
+            }
+            """;
+
+        JsonNode call = objectMapper.readTree(json);
+        String result = (String) method.invoke(generator, call);
+
+        assertNull(result, "Sans ExpectedQuayRef, aucun quai ne devrait être résolu");
+    }
+
+    @Test
+    void testHasSkippedStatusWithOnTime() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "hasSkippedStatus", JsonNode.class);
+        method.setAccessible(true);
+
+        // Le JSON utilisateur a DepartureStatus: ON_TIME et ArrivalStatus: ON_TIME
+        String json = """
+            {
+                "DepartureStatus": "ON_TIME",
+                "ArrivalStatus": "ON_TIME"
+            }
+            """;
+
+        JsonNode call = objectMapper.readTree(json);
+        boolean result = (boolean) method.invoke(generator, call);
+
+        assertFalse(result,
+            "ON_TIME ne doit pas être traité comme SKIPPED — le quai ne doit pas être éliminé pour cette raison");
+    }
+
+    @Test
+    void testIsEstimatedCallInPastWhenArrivalPastButDepartureFuture() throws Exception {
+        // Reproduit le cas où le train est à quai : arrivée passée, départ futur.
+        // isEstimatedCallInPast renvoie true dès que l'arrivée est passée,
+        // ce qui entraîne la suppression du STU et l'absence d'assignation de quai.
+        java.lang.reflect.Field epochField = TripUpdateGenerator.class.getDeclaredField("currentEpochSecond");
+        epochField.setAccessible(true);
+        epochField.setLong(generator, System.currentTimeMillis() / 1000);
+
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "isEstimatedCallInPast", JsonNode.class);
+        method.setAccessible(true);
+
+        String pastArrival  = java.time.Instant.now().minusSeconds(60).toString(); // arrivée il y a 1 min
+        String futureDeparture = java.time.Instant.now().plusSeconds(120).toString(); // départ dans 2 min
+
+        String json = String.format("""
+            {
+                "ExpectedArrivalTime": "%s",
+                "ExpectedDepartureTime": "%s"
+            }
+            """, pastArrival, futureDeparture);
+
+        JsonNode call = objectMapper.readTree(json);
+        boolean result = (boolean) method.invoke(generator, call);
+
+        // Ce test documente le comportement actuel : true (arrivée passée → tout l'arrêt est ignoré).
+        // Conséquence : si un train est à quai (arrivé mais pas encore parti),
+        // le STU est supprimé et le quai n'apparaît pas dans le feed.
+        assertTrue(result,
+            "Comportement actuel : dès que ExpectedArrivalTime est passée, isEstimatedCallInPast=true, "
+            + "même si le départ est dans le futur. Cela explique pourquoi le quai disparaît "
+            + "pour les trains déjà à quai.");
     }
 }

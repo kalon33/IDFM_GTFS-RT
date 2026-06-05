@@ -114,6 +114,12 @@ public class TripUpdateGenerator {
     /** SIRI Lite JSON field name for the expected quay (platform) reference */
     private static final String FIELD_EXPECTED_QUAY_REF = "ExpectedQuayRef";
 
+    /** SIRI Lite JSON field name for departure platform name */
+    private static final String FIELD_DEPARTURE_PLATFORM_NAME = "DeparturePlatformName";
+
+    /** SIRI Lite JSON field name for arrival platform name */
+    private static final String FIELD_ARRIVAL_PLATFORM_NAME = "ArrivalPlatformName";
+
     /** Blacklist of operator IDs to exclude from GTFS-RT feed and trip matching */
     private static final Set<String> OPERATOR_BLACKLIST = Set.of(
         "MeC_Bus_PC:Operator:*",
@@ -2965,13 +2971,18 @@ public class TripUpdateGenerator {
     }
 
     /**
-     * Extracts the quay stop ID from {@code DepartureStopAssignment} or
-     * {@code ArrivalStopAssignment} in a SIRI EstimatedCall.
+     * Extracts the quay stop ID from a SIRI EstimatedCall using two strategies:
      *
-     * <p>Format: {@code STIF:StopPoint:Q:471581:} → {@code IDFM:471581}.
-     * The stop_id is constructed directly from the numeric quay ID without
-     * a DB lookup, because quay stops may be absent from the unenriched
-     * gtfs.db but present in the enriched GTFS served via /gtfs.
+     * <ol>
+     *   <li><b>Primary</b>: {@code DepartureStopAssignment} or {@code ArrivalStopAssignment}
+     *       containing an {@code ExpectedQuayRef}. Format:
+     *       {@code STIF:StopPoint:Q:471581:} → {@code IDFM:471581}. Constructed
+     *       directly without a DB lookup.</li>
+     *   <li><b>Fallback</b>: {@code DeparturePlatformName} or {@code ArrivalPlatformName}
+     *       combined with the {@code StopPointRef} to find a sibling quay in the DB
+     *       that shares the same parent station and has the matching
+     *       {@code platform_code}.</li>
+     * </ol>
      */
     private String resolveQuayStopId(JsonNode estimatedCall) {
         for (String field : new String[]{FIELD_DEPARTURE_STOP_ASSIGNMENT, FIELD_ARRIVAL_STOP_ASSIGNMENT}) {
@@ -2982,6 +2993,25 @@ public class TripUpdateGenerator {
                 return "IDFM:" + parts[3];
             }
         }
+
+        // Fallback: resolve via DeparturePlatformName / ArrivalPlatformName
+        if (!estimatedCall.has(FIELD_STOP_POINT_REF)) return null;
+        String[] stopParts = estimatedCall.path(FIELD_STOP_POINT_REF).path(FIELD_VALUE).asText("").split(":");
+        if (stopParts.length < 4 || stopParts[3].isBlank()) return null;
+        String stopCode = stopParts[3];
+
+        // StopPointRef is already a quay (StopPoint:Q:) → return it directly
+        if (stopParts.length >= 3 && "Q".equals(stopParts[2]) && stopCode.matches("\\d+")) {
+            return "IDFM:" + stopCode;
+        }
+
+        for (String platformField : new String[]{FIELD_DEPARTURE_PLATFORM_NAME, FIELD_ARRIVAL_PLATFORM_NAME}) {
+            String platformCode = estimatedCall.path(platformField).path(FIELD_VALUE).asText("").trim();
+            if (platformCode.isEmpty()) continue;
+            String quayId = TripFinder.findStopByParentAndPlatformCode(stopCode, platformCode);
+            if (quayId != null) return quayId;
+        }
+
         return null;
     }
 

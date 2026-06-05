@@ -8,47 +8,62 @@ import java.util.*;
 import java.util.regex.*;
 import java.util.zip.*;
 
-import com.fasterxml.jackson.databind.*;
+import io.github.cdimascio.dotenv.Dotenv;
 import org.slf4j.*;
+import org.xml.sax.*;
+import org.xml.sax.helpers.DefaultHandler;
+
+import javax.xml.parsers.*;
 
 /**
- * Enriches a GTFS ZIP file's {@code stops.txt} with data sourced from IDFM
- * open-data APIs.
+ * Enriches a GTFS ZIP file's {@code stops.txt} with data sourced from the IDFM
+ * NeTEx API (PRIM marketplace).
  *
  * <p>Two operations are performed:
  * <ol>
  *   <li><b>Enrich existing stops</b>: fills the {@code platform_code} column
  *       for stops whose {@code stop_id} is {@code IDFM:{digits}} using the
- *       {@code publiccode} field from {@code arrets-transporteur.json}.</li>
- *   <li><b>Create missing stops</b>: for each entry in
- *       {@code arrets-transporteur.json} whose {@code arrid} has no
+ *       {@code PublicCode} field from the NeTEx Quay element.</li>
+ *   <li><b>Create missing stops</b>: for each NeTEx Quay whose arrid has no
  *       corresponding GTFS stop, a new row is appended using coordinates and
- *       name from the JSON and the {@code parent_station} from
- *       {@code relations.csv}.</li>
+ *       name from the NeTEx data and the {@code parent_station} from the
+ *       Quay's {@code ParentZoneRef} (monomodalStopPlace).</li>
  * </ol>
  *
- * <p>Data sources:
- * <ul>
- *   <li>arrets-transporteur JSON — arrid, publiccode, artname, artgeopoint,
- *       artfarezone</li>
- *   <li>relations CSV — arrid → zdcid (parent multimodal stop ID)</li>
- * </ul>
+ * <p>Coordinates in the NeTEx file are in Lambert 93 (EPSG:2154) and are
+ * converted to WGS84 via the inverse Lambert Conformal Conic projection.
  */
 public class GTFSEnricher {
 
     private static final Logger logger = LoggerFactory.getLogger(GTFSEnricher.class);
 
-    static final String ARRETS_TRANSPORTEUR_URL =
-        "https://data.iledefrance-mobilites.fr/api/explore/v2.1/catalog/datasets/arrets-transporteur/exports/json";
+    private static final Dotenv dotenv = Dotenv.configure().directory("/app").ignoreIfMissing().load();
 
-    static final String RELATIONS_URL =
-        "https://data.iledefrance-mobilites.fr/api/explore/v2.1/catalog/datasets/relations/exports/csv";
+    static final String NETEX_URL =
+        "https://prim.iledefrance-mobilites.fr/marketplace/icar/getData" +
+        "?method=getAll&GeneralGroupOfEntities=true&multimodalStopPlace=true" +
+        "&monomodalStopPlace=true&Quay_FR1=true&Quay_LOC=true" +
+        "&StopPlaceEntrance=true&destinations=true";
 
-    // Matches only pure-numeric stop IDs: "IDFM:471134"
     private static final Pattern PURE_NUMERIC_STOP_ID = Pattern.compile("^IDFM:(\\d+)$");
-
-    // Detects station-name strings (4+ consecutive letters)
     private static final Pattern STATION_NAME_LETTERS = Pattern.compile("[a-zA-ZÀ-ÿ]{4,}");
+    private static final Pattern ARTNAME_PLATFORM = Pattern.compile(
+        "(?:voie|quai)\\s+([A-Za-z0-9]{1,3})\\s*$", Pattern.CASE_INSENSITIVE);
+
+    // Extracts the numeric ID from NeTEx IDs like "FR::Quay:12345:FR1"
+    private static final Pattern NETEX_ID = Pattern.compile(":(\\d+):[A-Z0-9]+$");
+    // Extracts the zone number from "FR1:TariffZone:4:LOC"
+    private static final Pattern TARIFF_ZONE_NUM = Pattern.compile("TariffZone:(\\d+):");
+
+    private static final String NS = "http://www.netex.org.uk/netex";
+    private static final String GML_NS = "http://www.opengis.net/gml/3.2";
+
+    // -------------------------------------------------------------------------
+    // Data model
+    // -------------------------------------------------------------------------
+
+    record QuayData(String name, String lat, String lon,
+                    String tariffZone, String zdcid, String publicCode) {}
 
     // -------------------------------------------------------------------------
     // Public API
@@ -58,15 +73,6 @@ public class GTFSEnricher {
      * Produces an enriched GTFS ZIP at {@code outputZipPath} from the original
      * GTFS ZIP at {@code inputZipPath}.
      *
-     * <p>The enrichment consists of:
-     * <ul>
-     *   <li>Filling {@code platform_code} in {@code stops.txt} for existing
-     *       quay-level stops (pure numeric {@code stop_id}).</li>
-     *   <li>Appending new rows for quays present in arrets-transporteur but
-     *       absent from the GTFS, provided their parent station can be resolved
-     *       from relations.csv.</li>
-     * </ul>
-     *
      * @param inputZipPath  path to the original GTFS ZIP (e.g. IDFM-gtfs.zip)
      * @param outputZipPath path for the enriched output ZIP
      * @throws IOException on network or file errors
@@ -74,16 +80,14 @@ public class GTFSEnricher {
     public static void enrichGTFS(String inputZipPath, String outputZipPath) throws IOException {
         logger.info("Starting GTFS enrichment (platform_code + missing stops)…");
 
-        Map<String, JsonNode> arretData = fetchArretData();
-        logger.info("Fetched {} arret entries from arrets-transporteur", arretData.size());
+        Map<String, QuayData> quayData = new LinkedHashMap<>();
+        Map<String, String> arridToZdcid = new HashMap<>();
+        fetchNeTExData(quayData, arridToZdcid);
+        logger.info("Fetched {} quay entries from NeTEx", quayData.size());
 
-        Map<String, String> arridToZdcid = fetchRelations();
-        logger.info("Fetched {} arrid→zdcid relations", arridToZdcid.size());
-
-        rewriteZip(inputZipPath, outputZipPath, arretData, arridToZdcid);
+        rewriteZip(inputZipPath, outputZipPath, quayData, arridToZdcid);
         logger.info("Enriched GTFS written to {}", outputZipPath);
 
-        // Add elevator pathways (pathways.txt + virtual elevator stops in stops.txt)
         logger.info("Adding elevator pathways to enriched GTFS…");
         String tempPath = outputZipPath + ".elevtmp";
         try {
@@ -97,7 +101,6 @@ public class GTFSEnricher {
             java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(tempPath));
         }
 
-        // Add fares (fare_attributes.txt, fare_rules.txt, zone_id in stops.txt)
         logger.info("Adding fares to enriched GTFS…");
         String fareTempPath = outputZipPath + ".faretmp";
         try {
@@ -113,185 +116,255 @@ public class GTFSEnricher {
     }
 
     // -------------------------------------------------------------------------
-    // Data fetching
+    // NeTEx data fetching
+    // -------------------------------------------------------------------------
+
+    static void fetchNeTExData(Map<String, QuayData> quayMap, Map<String, String> arridToZdcid)
+            throws IOException {
+        String apiKey = dotenv.get("API_KEY", null);
+        URL url = URI.create(NETEX_URL).toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        if (apiKey != null) conn.setRequestProperty("apiKey", apiKey);
+        conn.setConnectTimeout(30_000);
+        conn.setReadTimeout(300_000);
+
+        try {
+            InputStream raw = conn.getInputStream();
+            String encoding = conn.getContentEncoding();
+            InputStream is = (encoding != null && encoding.equalsIgnoreCase("gzip"))
+                    ? new java.util.zip.GZIPInputStream(raw)
+                    : raw;
+            try {
+                SAXParserFactory factory = SAXParserFactory.newInstance();
+                factory.setNamespaceAware(true);
+                SAXParser saxParser = factory.newSAXParser();
+                NeTExSaxHandler handler = new NeTExSaxHandler();
+                saxParser.parse(is, handler);
+                quayMap.putAll(handler.quayMap);
+                arridToZdcid.putAll(handler.arridToZdcid);
+            } catch (SAXException | ParserConfigurationException e) {
+                throw new IOException("Failed to parse NeTEx XML", e);
+            }
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SAX handler for NeTEx Quay elements
+    // -------------------------------------------------------------------------
+
+    static class NeTExSaxHandler extends DefaultHandler {
+
+        final Map<String, QuayData> quayMap = new LinkedHashMap<>();
+        final Map<String, String> arridToZdcid = new HashMap<>();
+
+        private boolean inQuay = false;
+        private int quayDepth = 0;
+        private int depth = 0;
+
+        private String currentQuayId;
+        private String currentName;
+        private String currentPublicCode;
+        private String currentGmlPos;
+        private String currentTariffZone;
+        private String currentParentZoneRef;
+
+        private StringBuilder charBuffer = new StringBuilder();
+
+        @Override
+        public void startElement(String uri, String localName, String qName, Attributes attrs) {
+            depth++;
+
+            if (NS.equals(uri) && "Quay".equals(localName)) {
+                inQuay = true;
+                quayDepth = depth;
+                currentQuayId = extractNumericId(attrs.getValue("id"));
+                currentName = null;
+                currentPublicCode = null;
+                currentGmlPos = null;
+                currentTariffZone = null;
+                currentParentZoneRef = null;
+            }
+
+            if (inQuay) {
+                if (NS.equals(uri) && "TariffZoneRef".equals(localName) && currentTariffZone == null) {
+                    currentTariffZone = extractTariffZoneNum(attrs.getValue("ref"));
+                }
+                if (NS.equals(uri) && "ParentZoneRef".equals(localName)) {
+                    currentParentZoneRef = extractNumericId(attrs.getValue("ref"));
+                }
+            }
+
+            charBuffer = new StringBuilder();
+        }
+
+        @Override
+        public void characters(char[] ch, int start, int length) {
+            charBuffer.append(ch, start, length);
+        }
+
+        @Override
+        public void endElement(String uri, String localName, String qName) {
+            if (inQuay) {
+                String text = charBuffer.toString().trim();
+
+                if (NS.equals(uri)) {
+                    if ("Name".equals(localName) && depth == quayDepth + 1 && currentName == null) {
+                        currentName = text;
+                    }
+                    if ("PublicCode".equals(localName) && depth == quayDepth + 1) {
+                        currentPublicCode = text;
+                    }
+                }
+                if (GML_NS.equals(uri) && "pos".equals(localName) && currentGmlPos == null) {
+                    currentGmlPos = text;
+                }
+
+                if (NS.equals(uri) && "Quay".equals(localName) && depth == quayDepth) {
+                    storeCurrentQuay();
+                    inQuay = false;
+                    currentQuayId = null;
+                }
+            }
+
+            depth--;
+            charBuffer = new StringBuilder();
+        }
+
+        private void storeCurrentQuay() {
+            if (currentQuayId == null || currentQuayId.isEmpty()) return;
+
+            String lat = "", lon = "";
+            if (currentGmlPos != null) {
+                String[] parts = currentGmlPos.trim().split("\\s+");
+                if (parts.length >= 2) {
+                    try {
+                        double x = Double.parseDouble(parts[0]);
+                        double y = Double.parseDouble(parts[1]);
+                        double[] wgs84 = lambert93ToWGS84(x, y);
+                        lat = String.format(java.util.Locale.US, "%.7f", wgs84[0]);
+                        lon = String.format(java.util.Locale.US, "%.7f", wgs84[1]);
+                    } catch (NumberFormatException ignored) {}
+                }
+            }
+
+            String zdcid = currentParentZoneRef != null ? currentParentZoneRef : "";
+            QuayData qd = new QuayData(
+                currentName != null ? currentName : "",
+                lat, lon,
+                currentTariffZone != null ? currentTariffZone : "",
+                zdcid,
+                currentPublicCode != null ? currentPublicCode : ""
+            );
+            quayMap.put(currentQuayId, qd);
+            if (!zdcid.isEmpty()) arridToZdcid.put(currentQuayId, zdcid);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Coordinate conversion: Lambert 93 (EPSG:2154) → WGS84
     // -------------------------------------------------------------------------
 
     /**
-     * Downloads arrets-transporteur JSON and returns a map of
-     * {@code arrid → JsonNode} (full entry).
+     * Converts Lambert 93 (EPSG:2154) projected coordinates to WGS84
+     * geographic coordinates using the inverse Lambert Conformal Conic
+     * projection with GRS80 ellipsoid parameters.
      *
-     * <p>Entries with a null or blank {@code arrid} are skipped.
-     *
-     * @return arrid-keyed map of full JSON entries
-     * @throws IOException on network errors
+     * @param x easting in metres
+     * @param y northing in metres
+     * @return double[]{latitude, longitude} in decimal degrees
      */
-    static Map<String, JsonNode> fetchArretData() throws IOException {
-        URL url = URI.create(ARRETS_TRANSPORTEUR_URL).toURL();
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestProperty("Accept", "application/json");
-        conn.setRequestProperty("Accept-Encoding", "gzip");
-        conn.setConnectTimeout(30_000);
-        conn.setReadTimeout(120_000);
+    static double[] lambert93ToWGS84(double x, double y) {
+        final double a = 6378137.0;
+        final double f = 1.0 / 298.257222101;
+        final double e = Math.sqrt(2 * f - f * f);
 
-        Map<String, JsonNode> result = new LinkedHashMap<>();
-        try {
-            InputStream raw = conn.getInputStream();
-            String encoding = conn.getContentEncoding();
-            InputStream is = (encoding != null && encoding.equalsIgnoreCase("gzip"))
-                    ? new java.util.zip.GZIPInputStream(raw)
-                    : raw;
-            try (InputStreamReader isr = new InputStreamReader(is, StandardCharsets.UTF_8)) {
-                ObjectMapper mapper = new ObjectMapper();
-                JsonNode root = mapper.readTree(isr);
-                if (root.isArray()) {
-                    for (JsonNode entry : root) {
-                        String arrid = entry.path("arrid").asText(null);
-                        if (arrid != null && !arrid.isBlank()) {
-                            result.put(arrid, entry);
-                        }
-                    }
-                }
-            }
-        } finally {
-            conn.disconnect();
+        final double phi1 = Math.toRadians(44.0);
+        final double phi2 = Math.toRadians(49.0);
+        final double phi0 = Math.toRadians(46.5);
+        final double lambda0 = Math.toRadians(3.0);
+        final double FE = 700000.0;
+        final double FN = 6600000.0;
+
+        double m1 = lccM(phi1, e);
+        double m2 = lccM(phi2, e);
+        double t1 = lccT(phi1, e);
+        double t2 = lccT(phi2, e);
+        double t0 = lccT(phi0, e);
+
+        double n = (Math.log(m1) - Math.log(m2)) / (Math.log(t1) - Math.log(t2));
+        double bigF = m1 / (n * Math.pow(t1, n));
+        double rho0 = a * bigF * Math.pow(t0, n);
+
+        double xAdj = x - FE;
+        double yAdj = rho0 - (y - FN);
+        double rho = Math.copySign(Math.sqrt(xAdj * xAdj + yAdj * yAdj), n);
+        double theta = Math.atan2(xAdj, yAdj);
+        double tPrime = Math.pow(rho / (a * bigF), 1.0 / n);
+
+        double phi = Math.PI / 2 - 2 * Math.atan(tPrime);
+        for (int i = 0; i < 10; i++) {
+            double sinPhi = Math.sin(phi);
+            phi = Math.PI / 2 - 2 * Math.atan(
+                tPrime * Math.pow((1 - e * sinPhi) / (1 + e * sinPhi), e / 2));
         }
-        return result;
+
+        return new double[]{Math.toDegrees(phi), Math.toDegrees(theta / n + lambda0)};
     }
 
-    /**
-     * Downloads relations.csv and returns a map of {@code arrid → zdcid}.
-     *
-     * <p>The CSV header is read dynamically so column order does not matter.
-     * The delimiter is auto-detected (comma or semicolon) from the header line,
-     * and a leading UTF-8 BOM is stripped if present.
-     *
-     * @return arrid-keyed map of multimodal stop place IDs
-     * @throws IOException on network errors
-     */
-    static Map<String, String> fetchRelations() throws IOException {
-        URL url = URI.create(RELATIONS_URL).toURL();
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestProperty("Accept-Encoding", "gzip");
-        conn.setConnectTimeout(30_000);
-        conn.setReadTimeout(120_000);
-
-        Map<String, String> result = new HashMap<>();
-        try {
-            InputStream raw = conn.getInputStream();
-            String encoding = conn.getContentEncoding();
-            InputStream is = (encoding != null && encoding.equalsIgnoreCase("gzip"))
-                    ? new java.util.zip.GZIPInputStream(raw)
-                    : raw;
-            BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
-
-            String headerLine = reader.readLine();
-            if (headerLine == null) return result;
-
-            // Strip UTF-8 BOM if present
-            if (headerLine.startsWith("﻿")) {
-                headerLine = headerLine.substring(1);
-            }
-
-            // Auto-detect delimiter: count occurrences of ';' and ',' in the header
-            long semicolons = headerLine.chars().filter(c -> c == ';').count();
-            long commas = headerLine.chars().filter(c -> c == ',').count();
-            char delimiter = semicolons > commas ? ';' : ',';
-
-            String[] headers = splitCsv(headerLine, delimiter);
-            int arridIdx = -1, zdcidIdx = -1;
-            for (int i = 0; i < headers.length; i++) {
-                String h = headers[i].trim().toLowerCase(java.util.Locale.ROOT);
-                if ("arrid".equals(h)) arridIdx = i;
-                if ("zdcid".equals(h)) zdcidIdx = i;
-            }
-            if (arridIdx < 0 || zdcidIdx < 0) {
-                logger.warn("relations.csv: could not find arrid ({}) or zdcid ({}) column in header: {}",
-                        arridIdx, zdcidIdx, headerLine);
-                logger.warn("Detected delimiter: '{}', columns found: {}", delimiter,
-                        String.join(", ", headers));
-                return result;
-            }
-
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.trim().isEmpty()) continue;
-                String[] fields = splitCsv(line, delimiter);
-                if (fields.length <= Math.max(arridIdx, zdcidIdx)) continue;
-                String arrid = fields[arridIdx].trim();
-                String zdcid = fields[zdcidIdx].trim();
-                if (!arrid.isEmpty() && !zdcid.isEmpty()) {
-                    result.put(arrid, zdcid);
-                }
-            }
-        } finally {
-            conn.disconnect();
-        }
-        return result;
+    private static double lccM(double phi, double e) {
+        double sinPhi = Math.sin(phi);
+        return Math.cos(phi) / Math.sqrt(1 - e * e * sinPhi * sinPhi);
     }
 
-    /**
-     * Splits a CSV line using the given delimiter character, respecting
-     * double-quoted fields.
-     */
-    private static String[] splitCsv(String line, char delimiter) {
-        List<String> fields = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        boolean inQuotes = false;
-
-        for (int i = 0; i < line.length(); i++) {
-            char c = line.charAt(i);
-            if (c == '"') {
-                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
-                    current.append('"');
-                    i++;
-                } else {
-                    inQuotes = !inQuotes;
-                }
-            } else if (c == delimiter && !inQuotes) {
-                fields.add(current.toString());
-                current = new StringBuilder();
-            } else {
-                current.append(c);
-            }
-        }
-        fields.add(current.toString());
-        return fields.toArray(new String[0]);
+    private static double lccT(double phi, double e) {
+        double sinPhi = Math.sin(phi);
+        return Math.tan(Math.PI / 4 - phi / 2) /
+               Math.pow((1 - e * sinPhi) / (1 + e * sinPhi), e / 2);
     }
 
-    /**
-     * Convenience method: returns a simple {@code arrid → publiccode} map
-     * (only entries whose {@code publiccode} is a valid platform code).
-     *
-     * @return filtered platform codes map
-     * @throws IOException on network errors
-     */
-    static Map<String, String> fetchPlatformCodes() throws IOException {
-        Map<String, JsonNode> data = fetchArretData();
-        Map<String, String> result = new HashMap<>();
-        for (Map.Entry<String, JsonNode> e : data.entrySet()) {
-            String publiccode = e.getValue().path("publiccode").asText(null);
-            if (publiccode != null && !isStationName(publiccode)) {
-                result.put(e.getKey(), publiccode);
-            }
-        }
-        return result;
+    // -------------------------------------------------------------------------
+    // ID extraction helpers
+    // -------------------------------------------------------------------------
+
+    static String extractNumericId(String id) {
+        if (id == null) return "";
+        Matcher m = NETEX_ID.matcher(id);
+        return m.find() ? m.group(1) : "";
     }
+
+    static String extractTariffZoneNum(String ref) {
+        if (ref == null) return "";
+        Matcher m = TARIFF_ZONE_NUM.matcher(ref);
+        return m.find() ? m.group(1) : "";
+    }
+
+    // -------------------------------------------------------------------------
+    // Platform code resolution
+    // -------------------------------------------------------------------------
 
     /**
      * Returns {@code true} if {@code code} looks like a station name rather
      * than a platform code.
-     *
-     * <ul>
-     *   <li>null, empty, or {@code "-"} → true</li>
-     *   <li>longer than 6 chars AND contains 4+ consecutive letters → true</li>
-     * </ul>
      */
     static boolean isStationName(String code) {
         if (code == null || code.isEmpty() || "-".equals(code)) return true;
-        if (code.length() > 6) {
-            return STATION_NAME_LETTERS.matcher(code).find();
-        }
-        return false;
+        if (code.contains(" ") || code.contains("/")) return true;
+        return STATION_NAME_LETTERS.matcher(code).find();
+    }
+
+    /**
+     * Resolves the platform code for a NeTEx Quay.
+     *
+     * <p>Uses {@code PublicCode} when it is a valid platform code; otherwise
+     * falls back to extracting a short code from the quay name via patterns
+     * like "voie 2" or "Quai H" at the end of the name.
+     */
+    static String resolvePlatformCode(QuayData quay) {
+        if (!isStationName(quay.publicCode())) return quay.publicCode();
+        Matcher m = ARTNAME_PLATFORM.matcher(quay.name());
+        return m.find() ? m.group(1) : "";
     }
 
     // -------------------------------------------------------------------------
@@ -300,7 +373,7 @@ public class GTFSEnricher {
 
     private static void rewriteZip(
             String inputZipPath, String outputZipPath,
-            Map<String, JsonNode> arretData,
+            Map<String, QuayData> quayData,
             Map<String, String> arridToZdcid) throws IOException {
 
         Path inputPath = Paths.get(inputZipPath);
@@ -314,7 +387,7 @@ public class GTFSEnricher {
                 zout.putNextEntry(new ZipEntry(entry.getName()));
 
                 if ("stops.txt".equals(entry.getName())) {
-                    byte[] enriched = enrichStopsTxt(zin, arretData, arridToZdcid);
+                    byte[] enriched = enrichStopsTxt(zin, quayData, arridToZdcid);
                     zout.write(enriched);
                 } else {
                     zin.transferTo(zout);
@@ -326,21 +399,15 @@ public class GTFSEnricher {
         }
     }
 
-    /**
-     * Reads {@code stops.txt} from {@code inputStream}, fills
-     * {@code platform_code} for existing quay stops, appends new rows for
-     * missing quays, and returns the enriched bytes.
-     */
     private static byte[] enrichStopsTxt(
             InputStream inputStream,
-            Map<String, JsonNode> arretData,
+            Map<String, QuayData> quayData,
             Map<String, String> arridToZdcid) throws IOException {
 
         BufferedReader reader = new BufferedReader(
                 new InputStreamReader(inputStream, StandardCharsets.UTF_8));
         StringBuilder sb = new StringBuilder();
 
-        // --- Parse header ---
         String headerLine = reader.readLine();
         if (headerLine == null) return new byte[0];
 
@@ -353,7 +420,6 @@ public class GTFSEnricher {
         }
 
         boolean columnExists = platformCodeIdx >= 0;
-        // Normalised header for output (without BOM or stray spaces)
         String[] normalizedHeaders = Arrays.copyOf(headers, headers.length);
         for (int i = 0; i < normalizedHeaders.length; i++) {
             normalizedHeaders[i] = normalizedHeaders[i].trim();
@@ -363,7 +429,6 @@ public class GTFSEnricher {
             sb.append(headerLine).append("\n");
         } else {
             sb.append(headerLine).append(",platform_code\n");
-            // Extend normalised header for new row builder
             normalizedHeaders = Arrays.copyOf(normalizedHeaders, normalizedHeaders.length + 1);
             normalizedHeaders[normalizedHeaders.length - 1] = "platform_code";
             platformCodeIdx = normalizedHeaders.length - 1;
@@ -375,7 +440,6 @@ public class GTFSEnricher {
             return sb.toString().getBytes(StandardCharsets.UTF_8);
         }
 
-        // --- Process existing rows ---
         Set<String> existingArrids = new HashSet<>();
         int enrichedCount = 0;
         String line;
@@ -390,11 +454,8 @@ public class GTFSEnricher {
                 String arrid = m.group(1);
                 existingArrids.add(arrid);
 
-                JsonNode entry = arretData.get(arrid);
-                String platformCode = (entry != null)
-                        ? entry.path("publiccode").asText("")
-                        : "";
-                if (isStationName(platformCode)) platformCode = "";
+                QuayData qd = quayData.get(arrid);
+                String platformCode = (qd != null) ? resolvePlatformCode(qd) : "";
 
                 if (!platformCode.isEmpty() && platformCodeIdx < fields.length) {
                     fields[platformCodeIdx] = platformCode;
@@ -406,32 +467,21 @@ public class GTFSEnricher {
             sb.append(line).append("\n");
         }
 
-        // --- Append new rows for missing quays ---
         int createdCount = 0;
-        for (Map.Entry<String, JsonNode> e : arretData.entrySet()) {
+        for (Map.Entry<String, QuayData> e : quayData.entrySet()) {
             String arrid = e.getKey();
             if (existingArrids.contains(arrid)) continue;
 
             String zdcid = arridToZdcid.get(arrid);
             if (zdcid == null || zdcid.isBlank()) continue;
 
-            JsonNode arret = e.getValue();
-            JsonNode geoPoint = arret.path("artgeopoint");
-            if (geoPoint.isMissingNode()) continue;
-
-            String lat = geoPoint.path("lat").asText(null);
-            String lon = geoPoint.path("lon").asText(null);
-            if (lat == null || lon == null) continue;
-
-            String name = arret.path("artname").asText("");
-            String fareZone = arret.path("artfarezone").asText("");
-            String publiccode = arret.path("publiccode").asText("");
-            if (isStationName(publiccode)) publiccode = "";
+            QuayData qd = e.getValue();
+            if (qd.lat().isEmpty() || qd.lon().isEmpty()) continue;
 
             String newRow = buildNewStopRow(
                     normalizedHeaders, platformCodeIdx,
-                    "IDFM:" + arrid, name, lat, lon,
-                    fareZone, "IDFM:" + zdcid, publiccode);
+                    "IDFM:" + arrid, qd.name(), qd.lat(), qd.lon(),
+                    qd.tariffZone(), "IDFM:" + zdcid, resolvePlatformCode(qd));
             sb.append(newRow).append("\n");
             createdCount++;
         }
@@ -441,10 +491,6 @@ public class GTFSEnricher {
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
 
-    /**
-     * Builds a CSV row for a new stop, mapping known values to the correct
-     * column positions based on the actual header.
-     */
     private static String buildNewStopRow(
             String[] headers, int platformCodeIdx,
             String stopId, String stopName,
@@ -467,19 +513,16 @@ public class GTFSEnricher {
                 case "stop_timezone"      -> fields[i] = "Europe/Paris";
                 case "wheelchair_boarding"-> fields[i] = "0";
                 case "platform_code"      -> fields[i] = platformCode;
-                default                   -> {} // stop_desc, stop_url, etc. → ""
+                default                   -> {}
             }
         }
         return joinCsvLine(fields);
     }
 
     // -------------------------------------------------------------------------
-    // Minimal CSV helpers
+    // Minimal CSV helpers (also used by ElevatorEnricher, FareEnricher, GTFSFetcher)
     // -------------------------------------------------------------------------
 
-    /**
-     * Splits a single CSV line into fields, respecting double-quoted values.
-     */
     static String[] parseCsvLine(String line) {
         List<String> fields = new ArrayList<>();
         StringBuilder current = new StringBuilder();
@@ -505,10 +548,6 @@ public class GTFSEnricher {
         return fields.toArray(new String[0]);
     }
 
-    /**
-     * Joins fields back into a CSV line, quoting any field that contains a
-     * comma, double-quote, or newline.
-     */
     static String joinCsvLine(String[] fields) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < fields.length; i++) {

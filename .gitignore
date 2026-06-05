@@ -37,6 +37,7 @@ build/
 gtfs.db
 gtfs.db-shm
 gtfs.db-wal
+getAll.xml
 extracted-gtfs/
 IDFM-gtfs.zip
 IDFM-gtfs-enriched.zip
