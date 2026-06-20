@@ -582,9 +582,13 @@ public class TripFinder {
      *
      * <p>For operators like SNCF/Transilien, the SIRI {@code DatedVehicleJourneyRef} value is
      * typically a UUID suffix that appears verbatim in the GTFS {@code trip_id}
-     * (e.g. {@code IDFM:TN:SNCF:<uuid>}). This method looks up the trip using a
-     * {@code LIKE '%<vehicleRef>'} pattern and validates that the result belongs to
-     * the expected route, avoiding false positives from other operators.
+     * (e.g. {@code IDFM:TN:SNCF:<uuid>}). However, the raw value is wrapped as
+     * {@code <OPERATOR>:VehicleJourney::<id>:LOC} (e.g.
+     * {@code SNCF_MAGENTA_PRD:VehicleJourney::51194306-913c-4f27-8712-7cbd2776a14b:LOC}), so the
+     * wrapping prefix/suffix is stripped first to isolate the {@code <id>} segment that actually
+     * appears in {@code trip_id}. This method looks up the trip using a {@code LIKE '%<id>'}
+     * pattern and validates that the result belongs to the expected route, avoiding false
+     * positives from other operators.
      *
      * @param vehicleRef the raw DatedVehicleJourneyRef value from SIRI
      * @param routeId    the expected GTFS route ID (used to validate the match)
@@ -594,10 +598,17 @@ public class TripFinder {
         if (vehicleRef == null || vehicleRef.isEmpty() || routeId == null) {
             return null;
         }
+        // SIRI wraps the actual ID as "<OPERATOR>:VehicleJourney::<id>:LOC"; the id is the
+        // segment right before the trailing "LOC" marker, not the whole wrapped string.
+        String[] parts = vehicleRef.split(":");
+        String id = parts.length >= 2 ? parts[parts.length - 2] : vehicleRef;
+        if (id.isEmpty()) {
+            return null;
+        }
         String query = "SELECT trip_id FROM trips WHERE trip_id LIKE ? AND route_id = ? LIMIT 1";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query)) {
-            stmt.setString(1, "%" + vehicleRef);
+            stmt.setString(1, "%" + id);
             stmt.setString(2, routeId);
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
